@@ -1,0 +1,21 @@
+name: Rename to index
+on:
+  push:
+    paths:
+      - '.github/workflows/rename.yml'
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rename file
+        run: |
+          if [ -f maadraasaa-ayaap-qr.html ]; then
+            git config user.name "mdt832325-commits"
+            git config user.email "mdt832325@gmail.com"
+            git mv maadraasaa-ayaap-qr.html index.html
+            git commit -m "Rename to index.html"
+            git push
+          fi
