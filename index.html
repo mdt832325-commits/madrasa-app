@@ -2054,7 +2054,14 @@ function normPhone(p){
      for a link decision.
    - publicData() strips BOTH fields; the private node stores the
      numbers as an array in phones["s_"+id] (older string values
-     still restore via restoreStudentPhones). */
+     still restore via restoreStudentPhones).
+   - A guardian who signed up with a number the admin never added
+     can still find their own child (guardianSelfLinkFlow, home card
+     "🔍 আমার সন্তান খুঁজুন"): guardian name + child name + class +
+     roll must match exactly one student, and the entered guardian
+     name must match the recorded father or mother name when one is
+     recorded. The link is written exactly the way the admin path
+     writes it (student phones + guardianChildren). */
 var GUARDIAN_PHONE_MAX = 4;
 function studentGuardianPhones(st){
   var out = [];
@@ -2517,6 +2524,45 @@ function saveGuardianAccount(acc, cb){
   if(!guardianByPhone(acc.phone)) D.guardians.push(acc);
   persistLocal(); if(cb) cb();
 }
+/* ---------------- guardian self-link: direct writes a guardian device needs ----------------
+   A guardian device cannot use save() (it writes the private node
+   only for admins), so a guardian-side link — the name+roll self-link
+   (guardianSelfLinkFlow) — writes the same nodes the admin path
+   writes, directly: one student's numbers (private/phones/s_<id>)
+   and the per-phone child list (guardianChildren/<phone>).
+   In test mode (no rules yet) these writes succeed from any device;
+   if server rules are ever deployed, a guardian linking their own
+   child needs the matching write rule for these two paths. */
+function getStudentPhones(id){
+  var path = "private/phones/s_" + id;
+  var norm = function(v){
+    var arr = [];
+    if(Array.isArray(v)) arr = v;
+    else if(v) arr = [v];
+    var out = [];
+    arr.forEach(function(p){ var n = normPhone(p||""); if(n && out.indexOf(n)<0) out.push(n); });
+    return out;
+  };
+  if(restMode && fbDbUrl){ return restGet(path).then(norm).catch(function(){ return []; }); }
+  if(fbRoot){ return fbRoot.child("private").child("phones").child("s_" + id).once("value").then(function(snap){ return norm(snap.val()); }).catch(function(){ return []; }); }
+  /* Local-only (tests / offline): the public snapshot a guardian holds
+     carries no numbers, so read the in-memory record directly. */
+  var s = (D.students||[]).filter(function(x){ return x.id === id; })[0];
+  return Promise.resolve(s ? studentGuardianPhones(s) : []);
+}
+function putStudentPhones(id, phs){
+  var path = "private/phones/s_" + id;
+  if(restMode && fbDbUrl){ return restPut(path, phs); }
+  if(fbRoot){ return fbRoot.child("private").child("phones").child("s_" + id).set(phs); }
+  return Promise.resolve();
+}
+function putGuardianChildrenForPhone(ph, ids){
+  ph = normPhone(ph||"");
+  if(!ph) return Promise.resolve();
+  if(restMode && fbDbUrl){ return restPut("guardianChildren/" + ph, ids); }
+  if(fbRoot){ return fbRoot.child("guardianChildren").child(ph).set(ids); }
+  return Promise.resolve();
+}
 /* ---------------- শিক্ষক অ্যাকাউন্ট (ফোন + পাসওয়ার্ড) ----------------
    Teacher accounts mirror the guardian pattern, one child per phone:
    - teacherProfiles/<phone> = {phone, teacherId, name, classTaken, classes}:
@@ -2945,6 +2991,79 @@ function changeMyPasswordFlow(phone, role, currentPw, newPw, confirmPw, done){
     });
   });
 }
+/* Guardian self-link by name + roll (home card "🔍 আমার সন্তান খুঁজুন"
+   and the ⋮ menu row of the same name). A guardian who scanned the QR
+   outside the madrasa and signed up with a number the admin never
+   added can still find their own child: guardian name + child name +
+   class + roll. Matching is exact on the normalized name/roll/class —
+   nothing fuzzy, nothing revealed: a wrong guardian name is refused
+   without ever showing the recorded names, and multiple matches are
+   refused outright. The link is written the same way the admin path
+   writes it (putStudentPhones + putGuardianChildrenForPhone), because
+   a guardian device cannot use save() for the private node.
+   Errors are {ok:false, error:"..."}; success is {ok:true, student}.
+   The caller (submit branch) turns them into toasts. */
+function guardianSelfLinkNormName(s){
+  var t = String(s||"").replace(/[\u200c\u200d]/g,"").trim().replace(/\s+/g," ");
+  /* "মোহাম্মদ"/"মোহাম্মাদ" and "মোঃ" are the same name in practice —
+     normalize the long form to the short form before the fixer runs,
+     so a guardian who types either spelling matches the same record. */
+  t = t.replace(/^মোহাম্মদ\s+/,"মোঃ ").replace(/^মোহাম্মাদ\s+/,"মোঃ ");
+  return idcardFixMoPrefix(t);
+}
+function guardianSelfLinkNormRoll(s){
+  var t = bnToEnDigits(String(s==null?"":s)).trim();
+  if(/^\d+$/.test(t)) return String(parseInt(t,10));
+  return t;
+}
+function guardianSelfLinkFlow(gNameRaw, cNameRaw, clsRaw, rollRaw, done){
+  var ph = normPhone(guardianPhone||"");
+  if(!isGuardian() || !ph){ done({ ok:false, error:"no-account" }); return; }
+  var gName = guardianSelfLinkNormName(gNameRaw);
+  var cName = guardianSelfLinkNormName(cNameRaw);
+  var cls = String(clsRaw||"").trim();
+  var roll = guardianSelfLinkNormRoll(rollRaw);
+  if(!gName || !cName || !cls || !roll){ done({ ok:false, error:"missing" }); return; }
+  var matches = (D.students||[]).filter(function(s){
+    return (s.className||"")===cls
+      && guardianSelfLinkNormRoll(s.roll)===roll
+      && guardianSelfLinkNormName(s.name)===cName;
+  });
+  if(!matches.length){ done({ ok:false, error:"not-found" }); return; }
+  if(matches.length>1){ done({ ok:false, error:"multiple" }); return; }
+  var st = matches[0];
+  /* Parent-name check FIRST: when the record has a father or mother
+     name, the entered guardian name must match one of them. A miss is
+     refused WITHOUT revealing the recorded names. */
+  var f = guardianSelfLinkNormName(st.fatherName||"");
+  var m = guardianSelfLinkNormName(st.motherName||"");
+  if((f || m) && gName!==f && gName!==m){ done({ ok:false, error:"name-mismatch" }); return; }
+  if(studentHasGuardianPhone(st, ph)){ done({ ok:false, error:"already" }); return; }
+  if(studentGuardianPhones(st).length>=GUARDIAN_PHONE_MAX){ done({ ok:false, error:"max" }); return; }
+  /* Re-check against the live server list (the in-memory copy on a
+     guardian device carries no numbers — the public snapshot strips
+     them — so the live list is the truth), then write. */
+  getStudentPhones(st.id).then(function(live){
+    var next = (live||[]).slice();
+    if(next.indexOf(ph)>=0){ done({ ok:false, error:"already" }); return; }
+    if(next.length>=GUARDIAN_PHONE_MAX){ done({ ok:false, error:"max" }); return; }
+    next.push(ph);
+    next = next.slice(0, GUARDIAN_PHONE_MAX);
+    var stLocal = (D.students||[]).filter(function(x){ return x.id===st.id; })[0];
+    if(stLocal){ stLocal.guardianPhones = next; if(!stLocal.guardianPhone) stLocal.guardianPhone = next[0]; }
+    var ids = Array.isArray(ui.myChildIds) ? ui.myChildIds.slice() : [];
+    if(ids.indexOf(st.id)<0) ids.push(st.id);
+    putStudentPhones(st.id, next).then(function(){
+      putGuardianChildrenForPhone(ph, ids).catch(function(){}).then(function(){
+        ui.myChildIds = ids;
+        try{ localStorage.setItem(GUARDIAN_CHILDREN_KEY, JSON.stringify(ids)); }catch(e){}
+        try{ syncNativeDeviceFlags(); }catch(e){}
+        done({ ok:true, student: stLocal || st });
+      });
+    }).catch(function(){ done({ ok:false, error:"write" }); });
+  }).catch(function(){ done({ ok:false, error:"write" }); });
+}
+
 function fbAuthSignOut(){
   try{ var a = fbAuth(); if(a && a.signOut) a.signOut().catch(function(){}); }catch(e){}
   fbAuthUid = ""; fbAuthMode = "fallback"; fbAuthIdToken = "";
@@ -3156,6 +3275,7 @@ function render(){
   if(ui.sheet==="camera") sheetH += cameraSheetHtml();
   if(ui.sheet==="idcard-rotate") sheetH += idcardRotateSheetHtml();
   if(ui.sheet==="change-password") sheetH += changePasswordSheetHtml();
+  if(ui.sheet==="guardian-self-link") sheetH += guardianSelfLinkSheetHtml();
   if(shouldShowNotifyPrompt()) sheetH += notifyPopupHtml();
   /* Internet call overlays (v1.0.17): an incoming call must appear
      on ANY tab while the app is open, and the admin's calling /
@@ -3310,6 +3430,7 @@ function mastheadHtml(s){
       + (isGuardian() ? '<button type="button" class="menu-row" data-act="guardian-logout"><span><b>🚪 গার্জিয়ান থেকে লগআউট</b><small>ফোন: '+esc(guardianPhone)+'</small></span></button>' : "")
       + (isTeacher() ? '<button type="button" class="menu-row" data-act="teacher-logout"><span><b>🚪 শিক্ষক থেকে লগআউট</b><small>'+esc(ui.teacherName||"শিক্ষক")+'</small></span></button>' : "")
       + ((isGuardian() || isTeacher()) ? '<button type="button" class="menu-row" data-act="open-change-password">'+icon("lock")+'<span><b>🔑 পাসওয়ার্ড পরিবর্তন করুন</b><small>নতুন পাসওয়ার্ড নিজে বসান</small></span></button>' : "")
+      + (isGuardian() ? '<button type="button" class="menu-row" data-act="open-guardian-self-link">'+icon("search")+'<span><b>🔍 আমার সন্তান খুঁজুন</b><small>নাম, শ্রেণী ও রোল দিয়ে সন্তান যুক্ত করুন</small></span></button>' : "")
       + (logged ? '<button type="button" class="menu-row" data-act="logout"><span><b>🚪 অ্যাডমিন থেকে লগআউট</b><small>ফোন: '+esc(sessionPhone)+'</small></span></button>' : "")
       + "</div></div>";
   }
@@ -3442,6 +3563,16 @@ function homeHtml(s){
      Visible to guardians, teachers and admin alike — each phone
      controls only itself, and the admin does nothing. */
   html += azanCardHtml();
+  /* Guardian self-link (name + roll): a guardian who signed up with
+     a number the admin never added sees NO child — this gold card is
+     their way in. It shows only while they see no child at all; the
+     ⋮ menu row of the same name stays for linking a second child. */
+  if(isGuardian() && !myChildren().length){
+    html += '<div class="card" style="border:3px solid var(--gold-strong);background:linear-gradient(135deg,#fef3c7,#fde68a);color:#78350f;margin-bottom:12px;padding:16px;text-align:center">'
+      + '<div style="font-size:19px;font-weight:800;line-height:1.3">🔍 আমার সন্তান খুঁজুন</div>'
+      + '<p style="margin:6px 0 10px;color:#92400e">আপনার নাম, সন্তানের নাম, শ্রেণী ও রোল দিলেই সন্তান যুক্ত হয়ে যাবে — অ্যাডমিনকে বলার দরকার নেই।</p>'
+      + '<div class="row-btns" style="justify-content:center"><button type="button" class="btn gold" data-act="open-guardian-self-link">🔍 সন্তান খুঁজুন</button></div></div>';
+  }
   /* No guardian login/signup card here any more (2026-11-07): guardians log
      in once at the entry screen, so showing it again on the home tab —
      even to the logged-in admin — looked wrong. guardianEntryHtml() is
@@ -3497,6 +3628,24 @@ function studentsHtml(){
 }
 
 function studentDetailHtml(st){
+  var backBtn = '<button type="button" class="btn ghost small" data-act="'+(ui.tab==="mychild"?"mychild-back":"student-back")+'">'+icon("back","sm")+" তালিকায় ফিরুন</button>";
+  /* Student-detail LOCK (2026-11-11): a guardian may NEVER see
+     another student's information. Tapping any student card opens
+     this locked state unless the student is one of the guardian's
+     own linked children — no photo, no name, no class, no roll, no
+     attendance, no results, no fees, no messages. Admins keep full
+     access; teachers are unchanged (the gate applies to guardians
+     only — a teacher passes isGuardian() only when also logged in
+     as a guardian). When the child list is still loading, isMyChild
+     is false, so the lock errs on the safe side until the fetch
+     completes and re-renders. */
+  if(isGuardian() && !isAdmin() && !isMyChild(st)){
+    return backBtn
+      + '<div class="card" style="border:3px solid var(--danger);margin-top:12px;padding:18px;text-align:center">'
+      + '<div style="font-size:19px;font-weight:800;line-height:1.3">🔒 এই তথ্য শুধু ওই সন্তানের গার্জিয়ান দেখতে পারেন</div>'
+      + '<p class="dim small" style="margin:8px 0 12px">আপনার সন্তানের তথ্য দেখতে নিচের বোতামে চাপ দিন — নাম, শ্রেণী ও রোল দিয়ে সন্তান যুক্ত করা যাবে।</p>'
+      + '<div class="row-btns" style="justify-content:center"><button type="button" class="btn gold" data-act="open-guardian-self-link">🔍 আমার সন্তান খুঁজুন</button></div></div>';
+  }
   var myAtt = [], myRes = [], myFees = [];
   Object.keys(D.attendance).forEach(function(k){
     var rec = D.attendance[k] && D.attendance[k][st.id];
@@ -3527,7 +3676,7 @@ function studentDetailHtml(st){
     }
   }
   var present = myAtt.filter(function(a){ return a.status==="present"||a.status==="late"; }).length;
-  var html = '<button type="button" class="btn ghost small" data-act="'+(ui.tab==="mychild"?"mychild-back":"student-back")+'">'+icon("back","sm")+" তালিকায় ফিরুন</button>";
+  var html = backBtn;
   html += '<div class="founder-card" style="margin-top:12px">'
     + (safeImg(st.photo)?'<img src="'+safeImg(st.photo)+'" alt="শিক্ষার্থীর ছবি" />':'<div class="avatar-fallback">'+icon("grad","lg")+"</div>")
     + '<div><span class="chip">'+esc(st.className)+'</span><h3>'+esc(st.name)+"</h3><p style='margin:2px 0 0'>রোল: "+esc(bnNum(Number(st.roll)||st.roll))+"</p></div></div>";
@@ -3745,6 +3894,19 @@ function changePasswordSheetHtml(){
     + '<label class="f"><span>নতুন পাসওয়ার্ড</span><span class="pw-wrap"><input type="password" name="password" minlength="4" autocomplete="new-password" required /><button type="button" class="pw-eye" data-act="toggle-pw" aria-label="পাসওয়ার্ড দেখান/লুকান">'+icon("eye","sm")+'</button></span></label>'
     + '<label class="f"><span>নতুন পাসওয়ার্ড আবার দিন</span><span class="pw-wrap"><input type="password" name="password2" minlength="4" autocomplete="new-password" required /><button type="button" class="pw-eye" data-act="toggle-pw" aria-label="পাসওয়ার্ড দেখান/লুকান">'+icon("eye","sm")+'</button></span></label>'
     + '<div class="row-btns" style="margin-top:10px"><button type="submit" class="btn gold">পাসওয়ার্ড বদলান</button><button type="button" class="btn ghost" data-act="close-sheet">বাতিল</button></div>'
+    + '</form></div></div>';
+}
+
+function guardianSelfLinkSheetHtml(){
+  return '<div class="sheet-scrim" data-act="sheet-scrim"><div class="sheet" role="dialog" aria-label="আমার সন্তান খুঁজুন">'
+    + '<h2>🔍 আমার সন্তান খুঁজুন<button type="button" class="close-x" data-act="close-sheet" aria-label="বন্ধ করুন">'+icon("x","sm")+'</button></h2>'
+    + '<p class="dim small">QR স্ক্যান করে অ্যাকাউন্ট খুলেছেন, কিন্তু অ্যাডমিন আপনার নম্বর এখনো যোগ করেননি? নিচের সব ঘর পূরণ করুন — আপনার নাম, সন্তানের নাম, শ্রেণী ও রোল হুবহু মিললেই সন্তান আপনার সাথে যুক্ত হয়ে যাবে।</p>'
+    + '<form data-form="guardian-self-link">'
+    + '<label class="f"><span>আপনার নাম</span><input type="text" name="guardianName" required placeholder="যেমন: মোঃ আবু কাওছার" /></label>'
+    + '<label class="f"><span>সন্তানের নাম</span><input type="text" name="childName" required placeholder="যেমন: মোঃ ইমরান হাসান" /></label>'
+    + '<label class="f"><span>শ্রেণী</span><select name="className" required>'+classOptions("")+'</select></label>'
+    + '<label class="f"><span>রোল নম্বর</span><input type="text" name="roll" inputmode="numeric" required placeholder="যেমন: ৫" /></label>'
+    + '<div class="row-btns" style="margin-top:10px"><button type="submit" class="btn gold">সন্তান খুঁজুন</button><button type="button" class="btn ghost" data-act="close-sheet">বাতিল</button></div>'
     + '</form></div></div>';
 }
 
@@ -7169,6 +7331,7 @@ document.addEventListener("click", function(e){
   else if(act==="open-install"){ ui.sheet="install"; ui.menuOpen=false; render(); }
   else if(act==="open-apk"){ ui.sheet="apk"; ui.menuOpen=false; render(); }
   else if(act==="open-change-password"){ ui.sheet="change-password"; ui.menuOpen=false; render(); }
+  else if(act==="open-guardian-self-link"){ ui.sheet="guardian-self-link"; ui.menuOpen=false; render(); }
   else if(act==="apk-download"){
     /* Mark this version seen ONLY when the download link itself is
        tapped — a guardian who only opened the sheet (or the menu) must
@@ -9000,6 +9163,27 @@ document.addEventListener("submit", function(e){
       ui.sheet=null; render();
       if(res.auth==="stale-auth") toast("পাসওয়ার্ড বদলানো হয়েছে। তবে পুরনো পাসওয়ার্ডটি এখনো কাজ করতে পারে — অ্যাডমিনকে জানান");
       else toast("পাসওয়ার্ড বদলানো হয়েছে — নতুন পাসওয়ার্ড দিয়েই লগইন করুন");
+    });
+  }
+  else if(kind==="guardian-self-link"){
+    /* Self-link by name + roll (home card / menu "🔍 আমার সন্তান
+       খুঁজুন"): a guardian who signed up with a number the admin
+       never added finds their own child by name + class + roll. */
+    if(!isGuardian()){ toast("সন্তান খুঁজতে আগে গার্জিয়ান হিসেবে লগইন করুন"); return; }
+    guardianSelfLinkFlow(v("guardianName"), v("childName"), v("className"), v("roll"), function(res){
+      if(!res.ok){
+        if(res.error==="missing") toast("সব ঘর পূরণ করুন — আপনার নাম, সন্তানের নাম, শ্রেণী ও রোল");
+        else if(res.error==="not-found") toast("সন্তান পাওয়া যায়নি — নাম, শ্রেণী ও রোল আবার দেখে দিন, অথবা অ্যাডমিনের সাথে যোগাযোগ করুন");
+        else if(res.error==="multiple") toast("একাধিক মিল পাওয়া গেছে — অ্যাডমিনের সাথে যোগাযোগ করুন");
+        else if(res.error==="name-mismatch") toast("নাম মেলেনি — অ্যাডমিনের সাথে যোগাযোগ করুন");
+        else if(res.error==="already") toast("এই সন্তানটি ইতিমধ্যে আপনার সাথে যুক্ত আছে");
+        else if(res.error==="max") toast("এই সন্তানের সাথে ইতিমধ্যে সর্বোচ্চ ৪টি নম্বর যুক্ত আছে — অ্যাডমিনের সাথে যোগাযোগ করুন");
+        else if(res.error==="no-account") toast("অ্যাকাউন্ট পাওয়া যায়নি — আবার লগইন করুন");
+        else toast("সন্তান যুক্ত করা যায়নি — ইন্টারনেট দেখে আবার চেষ্টা করুন");
+        return;
+      }
+      ui.sheet=null; render();
+      toast("সন্তান যুক্ত হয়েছে — "+(res.student ? res.student.name : "সন্তান")+" এখন আপনার সাথে যুক্ত");
     });
   }
   else if(kind==="settings"){
