@@ -7863,6 +7863,21 @@ function fileToDataUrl(file, maxW){
   });
 }
 
+/* FileReader fallback for photo picking: if the canvas decode in
+   fileToDataUrl fails (unusual format, huge image, canvas OOM), the
+   raw file bytes are still usable as a data URL — used uncompressed.
+   Only used when fileToDataUrl rejects, never for the first try. */
+function readFileAsDataUrl(file){
+  return new Promise(function(resolve, reject){
+    var done=false;
+    var timer=setTimeout(function(){ if(!done){ done=true; reject(new Error("timeout")); } }, 15000);
+    var rd=new FileReader();
+    rd.onload=function(){ if(!done){ done=true; clearTimeout(timer); resolve(rd.result); } };
+    rd.onerror=function(){ if(!done){ done=true; clearTimeout(timer); reject(new Error("read")); } };
+    try{ rd.readAsDataURL(file); }catch(e){ if(!done){ done=true; clearTimeout(timer); reject(e); } }
+  });
+}
+
 /* ---- Photo picking (robust) ----
    WHY this exists: the old picker was a hidden <input type="file"> rendered
    INSIDE #app. Every render() rebuilds #app, so a Firebase sync snapshot
@@ -7876,11 +7891,20 @@ function fileToDataUrl(file, maxW){
    NOTE for the APK: a plain Android WebView also needs a WebChromeClient
    with onShowFileChooser, or tapping any file input does nothing at all.
    That lives in the APK's MainActivity.java, not in this HTML file. */
+/* Off-screen (NOT display:none) picker inputs: a programmatic
+   .click() on a display:none <input type="file"> opens nothing in
+   some Android WebViews, so every picker input lives off-screen
+   instead — reachable by the browser, invisible to the user. */
+function hidePickerInput(inp){
+  inp.style.position="fixed"; inp.style.left="-9999px"; inp.style.top="0";
+  inp.style.width="1px"; inp.style.height="1px"; inp.style.opacity="0";
+  inp.style.pointerEvents="none";
+}
 var photoInput=null, pendingPhotoKind="";
 function ensurePhotoInput(){
   if(photoInput) return photoInput;
   var inp=document.createElement("input");
-  inp.type="file"; inp.accept="image/*"; inp.style.display="none";
+  inp.type="file"; inp.accept="image/*"; hidePickerInput(inp);
   inp.addEventListener("change", function(){
     var f=inp.files && inp.files[0];
     if(f) handlePhotoFile(f);
@@ -7900,7 +7924,7 @@ var cameraInput=null;
 function ensureCameraInput(){
   if(cameraInput) return cameraInput;
   var inp=document.createElement("input");
-  inp.type="file"; inp.accept="image/*"; inp.setAttribute("capture","environment"); inp.style.display="none";
+  inp.type="file"; inp.accept="image/*"; inp.setAttribute("capture","environment"); hidePickerInput(inp);
   inp.addEventListener("change", function(){
     var f=inp.files && inp.files[0];
     if(f) handlePhotoFile(f);
@@ -7909,6 +7933,42 @@ function ensureCameraInput(){
   document.body.appendChild(inp);
   cameraInput=inp;
   return inp;
+}
+/* Shared success path for a picked photo — canvas-compressed
+   (fileToDataUrl) or FileReader fallback (raw bytes, no compression):
+   store it in the right pending field, update the in-place preview,
+   toast. The stored type is the data URL's own mime: the canvas path
+   always produces image/jpeg, the fallback keeps the file's true
+   type (PNG/WebP/…). */
+function photoUrlReady(file, url){
+  var kind=pendingPhotoKind||"student";
+  var mm=/^data:(image\/[a-z0-9.+-]+);/.exec(url);
+  var mime=mm?mm[1]:"image/jpeg";
+  /* Homework photos and result attachments ride on their own
+     pending lists (max 3 each) and update their preview rows in
+     place — no re-render, so typed form text is never wiped. */
+  if(kind==="homework"){
+    if(!Array.isArray(ui.pendingHomeworkPhotos)) ui.pendingHomeworkPhotos=[];
+    if(ui.pendingHomeworkPhotos.length>=3){ toast("একটি হোমওয়ার্কে সর্বোচ্চ ৩টি ছবি দেওয়া যায়"); return; }
+    ui.pendingHomeworkPhotos.push({ name:(file.name||"camera.jpg"), type:mime, data:url, sizeKB:Math.max(1, Math.round(url.length*3/4/1024)) });
+    updateHomeworkPhotoPreview();
+    toast("ছবি যোগ হয়েছে — হোমওয়ার্ক দিলে গার্জিয়ানরা দেখতে পাবেন");
+    return;
+  }
+  if(kind==="result"){
+    if(!Array.isArray(ui.pendingResultAttachments)) ui.pendingResultAttachments=[];
+    if(ui.pendingResultAttachments.length>=3){ toast("একটি রেজাল্টে সর্বোচ্চ ৩টি ফাইল দেওয়া যায়"); return; }
+    ui.pendingResultAttachments.push({ name:(file.name||"camera.jpg"), type:mime, data:url, sizeKB:Math.max(1, Math.round(url.length*3/4/1024)) });
+    updateResultAttachPreview();
+    toast("ছবি যোগ হয়েছে — রেজাল্ট সংরক্ষণ করলে গার্জিয়ানরা দেখতে পাবেন");
+    return;
+  }
+  if(kind==="student") ui.pendingStudentPhoto=url;
+  else if(kind==="teacher") ui.pendingTeacherPhoto=url;
+  else if(kind==="founder") ui.pendingFounderPhoto=url;
+  else if(kind==="logo") ui.pendingLogo=url;
+  updatePhotoPreview(kind, url);
+  toast("ছবি বেছে নেওয়া হয়েছে — নিচে সংরক্ষণ করুন");
 }
 function handlePhotoFile(file){
   var kind=pendingPhotoKind||"student";
@@ -7922,34 +7982,16 @@ function handlePhotoFile(file){
     fileToDataUrl(file, 2000).then(function(url){ openIdCardRotateSheet(url); }).catch(function(){ idcardSetStatus("❌ ছবি পড়া যায়নি — আবার চেষ্টা করুন"); toast("ছবি পড়া যায়নি — আবার চেষ্টা করুন"); });
     return;
   }
-  fileToDataUrl(file).then(function(url){
-    /* Homework photos and result attachments ride on their own
-       pending lists (max 3 each) and update their preview rows in
-       place — no re-render, so typed form text is never wiped.
-       Compression is the same 800px JPEG as every other photo. */
-    if(kind==="homework"){
-      if(!Array.isArray(ui.pendingHomeworkPhotos)) ui.pendingHomeworkPhotos=[];
-      if(ui.pendingHomeworkPhotos.length>=3){ toast("একটি হোমওয়ার্কে সর্বোচ্চ ৩টি ছবি দেওয়া যায়"); return; }
-      ui.pendingHomeworkPhotos.push({ name:(file.name||"camera.jpg"), type:"image/jpeg", data:url, sizeKB:Math.max(1, Math.round(url.length*3/4/1024)) });
-      updateHomeworkPhotoPreview();
-      toast("ছবি যোগ হয়েছে — হোমওয়ার্ক দিলে গার্জিয়ানরা দেখতে পাবেন");
-      return;
-    }
-    if(kind==="result"){
-      if(!Array.isArray(ui.pendingResultAttachments)) ui.pendingResultAttachments=[];
-      if(ui.pendingResultAttachments.length>=3){ toast("একটি রেজাল্টে সর্বোচ্চ ৩টি ফাইল দেওয়া যায়"); return; }
-      ui.pendingResultAttachments.push({ name:(file.name||"camera.jpg"), type:"image/jpeg", data:url, sizeKB:Math.max(1, Math.round(url.length*3/4/1024)) });
-      updateResultAttachPreview();
-      toast("ছবি যোগ হয়েছে — রেজাল্ট সংরক্ষণ করলে গার্জিয়ানরা দেখতে পাবেন");
-      return;
-    }
-    if(kind==="student") ui.pendingStudentPhoto=url;
-    else if(kind==="teacher") ui.pendingTeacherPhoto=url;
-    else if(kind==="founder") ui.pendingFounderPhoto=url;
-    else if(kind==="logo") ui.pendingLogo=url;
-    updatePhotoPreview(kind, url);
-    toast("ছবি বেছে নেওয়া হয়েছে — নিচে সংরক্ষণ করুন");
-  }).catch(function(){ toast("ছবি পড়া যায়নি — অন্য ছবি চেষ্টা করুন"); });
+  fileToDataUrl(file).then(function(url){ photoUrlReady(file, url); }).catch(function(){
+    /* Canvas decode failed (unusual format, huge image, canvas OOM):
+       fall back to the raw file bytes. Skips only the 800px
+       compression — the pending-photo / preview / toast path is the
+       same. A non-image data URL is refused, never stored. */
+    readFileAsDataUrl(file).then(function(raw){
+      if(typeof raw==="string" && raw.indexOf("data:image/")===0){ photoUrlReady(file, raw); }
+      else { toast("ছবি পড়া যায়নি — অন্য ছবি চেষ্টা করুন"); }
+    }).catch(function(){ toast("ছবি পড়া যায়নি — অন্য ছবি চেষ্টা করুন"); });
+  });
 }
 function updatePhotoPreview(kind, url){
   var btn=document.querySelector('[data-photo-pick="'+kind+'"]');
@@ -8711,7 +8753,7 @@ var idcardInput=null;
 function ensureIdCardInput(){
   if(idcardInput) return idcardInput;
   var inp=document.createElement("input");
-  inp.type="file"; inp.accept="image/*"; inp.style.display="none";
+  inp.type="file"; inp.accept="image/*"; hidePickerInput(inp);
   inp.addEventListener("change", function(){
     var f=inp.files && inp.files[0];
     if(f) handleIdCardFile(f);
@@ -8747,7 +8789,7 @@ function ensureNoticeAttachInput(){
   var inp=document.createElement("input");
   inp.type="file";
   inp.accept="image/*,.pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  inp.style.display="none";
+  hidePickerInput(inp);
   inp.addEventListener("change", function(){
     var f=inp.files && inp.files[0];
     if(f) handleNoticeAttachFile(f);
@@ -8813,7 +8855,7 @@ function ensureResultAttachInput(){
   var inp=document.createElement("input");
   inp.type="file";
   inp.accept="image/*,.pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  inp.style.display="none";
+  hidePickerInput(inp);
   inp.addEventListener("change", function(){
     var f=inp.files && inp.files[0];
     if(f) handleResultAttachFile(f);
